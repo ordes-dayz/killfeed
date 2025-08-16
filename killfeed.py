@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 import logging
 
+# Windows-specific imports for shared file access
+if os.name == 'nt':  # Windows
+    import msvcrt
+    import io
+
 # Optional hardcoded configuration. Keep blank to use arguments instead.
 # Windows example: DAYZ_LOGS_DIR = r"C:\DayZServer\profiles"
 # Linux example: DAYZ_LOGS_DIR = "/opt/dayzserver/profiles"
@@ -31,6 +36,18 @@ DELAY_BEFORE_SEND = 300 # seconds to wait before send webhook
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def open_shared_read(filepath: str):
+    """
+    Open file for reading with shared access on Windows, normal on Unix
+    This allows other processes (like DayZ server) to write to the file
+    
+    On Windows, we use a different approach: read the file in chunks periodically
+    rather than keeping it open continuously.
+    """
+    # For now, just return regular file handle - we'll modify the monitoring approach
+    return open(filepath, 'r', encoding='utf-8', errors='ignore')
 
 
 class DayZLogParser:
@@ -326,8 +343,8 @@ class DayZLogParser:
         logger.info("Starting DayZ ADM file monitoring...")
         
         while not self.shutdown_requested:
-            # Check for newer files periodically
-            if self.should_check_for_newer_file() or self.current_log_file is None:
+            # Find initial file or check for newer files if current file monitoring exited
+            if self.current_log_file is None:
                 latest_file = self.find_latest_adm_file()
                 
                 if not latest_file:
@@ -335,12 +352,20 @@ class DayZLogParser:
                     await asyncio.sleep(30)
                     continue
                     
-                # Switch to newer file if found
-                if latest_file != self.current_log_file:
-                    if self.current_log_file:
-                        logger.info(f"Switching from {self.current_log_file} to {latest_file}")
-                    else:
-                        logger.info(f"Starting monitoring: {latest_file}")
+                logger.info(f"Starting monitoring: {latest_file}")
+                self.current_log_file = latest_file
+                # Start at end of new file to only process new lines
+                try:
+                    file_size = os.path.getsize(latest_file)
+                    self.set_file_position(latest_file, file_size)
+                    logger.info(f"Starting at end of file (position: {file_size})")
+                except OSError:
+                    self.set_file_position(latest_file, 0)
+            else:
+                # Check if we need to switch files after monitor_single_file exited
+                latest_file = self.find_latest_adm_file()
+                if latest_file and latest_file != self.current_log_file:
+                    logger.info(f"Switching from {self.current_log_file} to {latest_file}")
                     self.current_log_file = latest_file
                     # Start at end of new file to only process new lines
                     try:
@@ -354,55 +379,84 @@ class DayZLogParser:
                 await asyncio.sleep(5)
                 continue
                 
-            # Monitor the current file
+            # Monitor the current file (this will exit when a newer file is found)
             try:
                 await self.monitor_single_file(self.current_log_file)
+                # After monitor_single_file exits, loop back to check for file switch
             except Exception as e:
                 logger.error(f"Error monitoring {self.current_log_file}: {e}")
                 await asyncio.sleep(5)
 
     async def monitor_single_file(self, filepath: str):
-        """Monitor a single log file for changes"""
-
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                # Seek to last known position
+        """Monitor a single log file for changes using periodic reads (Windows-friendly)"""
+        
+        last_file_check_time = time.time()
+        
+        while not self.shutdown_requested:
+            try:
+                # Open file, read new content, then close it (prevents locking)
                 last_pos = self.get_file_position(filepath)
-                f.seek(last_pos)
-
-                while not self.shutdown_requested:
-                    line = f.readline()
-                    if line:
-                        # Parse for kill events
-                        kill_data = self.parse_kill_event(line)
-                        if kill_data:
-                            message = self.format_discord_message(kill_data)
-                            if message:
-                                self.queue_message(message)
-
-                        # Update position
-                        self.set_file_position(filepath, f.tell())
-                    else:
-                        # No new data, wait a bit
-                        await asyncio.sleep(1)
-
-                        # Check if file was rotated (size decreased)
-                        try:
-                            current_size = os.path.getsize(filepath)
-                            if current_size < last_pos:
-                                logger.info(f"Log file rotated: {filepath}")
-                                self.set_file_position(filepath, 0)
-                                f.seek(0)
-                                last_pos = 0
-                        except OSError:
-                            # File might have been deleted/moved
-                            logger.warning(f"Could not access file: {filepath}")
+                
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    # Seek to last known position
+                    f.seek(last_pos)
+                    
+                    # Read all available new lines
+                    new_lines = []
+                    while True:
+                        line = f.readline()
+                        if line:
+                            new_lines.append(line)
+                        else:
                             break
+                    
+                    # Update position after reading
+                    new_pos = f.tell()
+                    
+                # File is now closed, process the lines we read
+                for line in new_lines:
+                    kill_data = self.parse_kill_event(line)
+                    if kill_data:
+                        message = self.format_discord_message(kill_data)
+                        if message:
+                            self.queue_message(message)
+                
+                # Update position after processing all lines
+                if new_lines:
+                    self.set_file_position(filepath, new_pos)
+                    
+                # Check for newer files periodically
+                current_time = time.time()
+                if current_time - last_file_check_time >= self.config["file_check_interval"]:
+                    last_file_check_time = current_time
+                    latest_file = self.find_latest_adm_file()
+                    
+                    # If we found a newer file, exit this function to switch
+                    if latest_file and latest_file != filepath:
+                        logger.info(f"Found newer file {latest_file}, exiting current file monitoring")
+                        break
 
-        except FileNotFoundError:
-            logger.warning(f"Log file not found: {filepath}")
-        except Exception as e:
-            logger.error(f"Error monitoring {filepath}: {e}")
+                # Check if file was rotated (size decreased)
+                try:
+                    current_size = os.path.getsize(filepath)
+                    if current_size < last_pos:
+                        logger.info(f"Log file rotated: {filepath}")
+                        self.set_file_position(filepath, 0)
+                except OSError:
+                    # File might have been deleted/moved
+                    logger.warning(f"Could not access file: {filepath}")
+                    break
+                    
+                # Wait before next check
+                await asyncio.sleep(1)
+                
+            except FileNotFoundError:
+                logger.warning(f"Log file not found: {filepath}")
+                await asyncio.sleep(5)
+                break
+            except Exception as e:
+                logger.error(f"Error monitoring {filepath}: {e}")
+                await asyncio.sleep(5)
 
     async def run(self):
         """Main run loop"""
